@@ -2266,7 +2266,15 @@ pfs_new_thread_v1(PSI_thread_key key, const void *identity, ulonglong processlis
 
   PFS_thread_class *klass= find_thread_class(key);
   if (likely(klass != NULL))
+  {
     pfs= create_thread(klass, identity, processlist_id);
+    if (pfs != NULL)
+    {
+      PFS_thread *parent= my_thread_get_THR_PFS();
+      if (parent != NULL)
+        pfs->m_parent_thread_internal_id= parent->m_parent_thread_internal_id;
+    }
+  }
   else
     pfs= NULL;
 
