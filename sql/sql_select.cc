@@ -18023,18 +18023,19 @@ class Create_tmp_table: public Data_type_statistics
   ORDER *m_group;
   bool m_distinct;
   bool m_save_sum_fields;
+  bool m_with_cycle;
   ulonglong m_select_options;
   ha_rows m_rows_limit;
-  uint m_hidden_field_count;       // Remove this eventually
   uint m_group_null_items;
-  uint m_cycle_fields_count;
-  uint m_null_count;
-  uint m_cycle_null_count;
-  uint m_cycle_blobs_count;
-  uint m_cycle_uneven_bit_length;
-  uint m_hidden_uneven_bit_length;
-  uint m_hidden_null_count;
+
+  uint m_field_count[2];
+  uint m_null_count[2];
+  uint m_blobs_count[2];
+  uint m_uneven_bit[2];
+
 public:
+  enum counter {distinct, other};
+  counter current_counter;
   Create_tmp_table(const TMP_TABLE_PARAM *param,
                    ORDER *group, bool distinct, bool save_sum_fields,
                    ulonglong select_options, ha_rows rows_limit)
@@ -18044,18 +18045,21 @@ public:
     m_group(group),
     m_distinct(distinct),
     m_save_sum_fields(save_sum_fields),
+    m_with_cycle(false),
     m_select_options(select_options),
     m_rows_limit(rows_limit),
-    m_hidden_field_count(param->hidden_field_count),
     m_group_null_items(0),
-    m_cycle_fields_count(0),
-    m_null_count(0),
-    m_cycle_null_count(0),
-    m_cycle_blobs_count(0),
-    m_cycle_uneven_bit_length(0),
-    m_hidden_uneven_bit_length(0),
-    m_hidden_null_count(0)
-  { }
+    current_counter(other)
+  {
+    m_field_count[Create_tmp_table::distinct]= 0;
+    m_field_count[Create_tmp_table::other]= 0;
+    m_null_count[Create_tmp_table::distinct]= 0;
+    m_null_count[Create_tmp_table::other]= 0;
+    m_blobs_count[Create_tmp_table::distinct]= 0;
+    m_blobs_count[Create_tmp_table::other]= 0;
+    m_uneven_bit[Create_tmp_table::distinct]= 0;
+    m_uneven_bit[Create_tmp_table::other]= 0;
+  }
 
   void add_field(TABLE *table, Field *field, uint fieldnr, bool force_not_null_cols);
 
@@ -18088,13 +18092,16 @@ void Create_tmp_table::add_field(TABLE *table, Field *field, uint fieldnr, bool 
   }
 
   if (!(field->flags & NOT_NULL_FLAG))
-    m_null_count++;
+    m_null_count[current_counter]++;
 
   table->s->reclength+= field->pack_length();
 
   // Assign it here, before update_data_type_statistics() changes m_blob_count
   if (field->flags & BLOB_FLAG)
+  {
     table->s->blob_field[m_blob_count]= fieldnr;
+    m_blobs_count[current_counter]++;
+  }
 
   table->field[fieldnr]= field;
   field->field_index= fieldnr;
@@ -18317,8 +18324,21 @@ bool Create_tmp_table::add_fields(THD *thd,
   Item *item;
   Field **tmp_from_field= m_from_field;
   uint uneven_delta;
+  if (m_distinct)
+  {
+    while ((item=li++) && !m_with_cycle)
+      if (item->common_flags & IS_IN_WITH_CYCLE)
+        m_with_cycle= true;
+  }
+  li.rewind();
   while ((item=li++))
   {
+    current_counter= (((param->hidden_field_count < (fieldnr + 1)) &&
+                       m_distinct &&
+                       (!m_with_cycle ||
+                        (item->common_flags & IS_IN_WITH_CYCLE)))?
+                      distinct :
+                      other);
     Item::Type type= item->type();
     if (type == Item::COPY_STR_ITEM)
     {
@@ -18343,7 +18363,8 @@ bool Create_tmp_table::add_fields(THD *thd,
 	  continue;
         }
       }
-      if (item->const_item() && (int) m_hidden_field_count <= 0)
+      if (item->const_item() &&
+          param->hidden_field_count < (fieldnr + 1))
         continue; // We don't have to store this
     }
     if (type == Item::SUM_FUNC_ITEM && !m_group && !m_save_sum_fields)
@@ -18375,6 +18396,7 @@ bool Create_tmp_table::add_fields(THD *thd,
           uneven_delta= m_uneven_bit_length;
           add_field(table, new_field, fieldnr++, param->force_not_null_cols);
           uneven_delta= m_uneven_bit_length - uneven_delta;
+          m_field_count[current_counter]++;
 
 	  if (!(new_field->flags & NOT_NULL_FLAG))
           {
@@ -18384,6 +18406,8 @@ bool Create_tmp_table::add_fields(THD *thd,
             */
             arg->maybe_null=1;
           }
+          if (current_counter == distinct)
+            new_field->flags|= FIELD_PART_OF_TMP_UNIQUE;
 	}
       }
     }
@@ -18454,49 +18478,17 @@ bool Create_tmp_table::add_fields(THD *thd,
       uneven_delta= m_uneven_bit_length;
       add_field(table, new_field, fieldnr++, param->force_not_null_cols);
       uneven_delta= m_uneven_bit_length - uneven_delta;
+      m_field_count[current_counter]++;
 
       if (item->marker == 4 && item->maybe_null)
       {
         m_group_null_items++;
 	new_field->flags|= GROUP_FLAG;
       }
-      if (item->common_flags & IS_IN_WITH_CYCLE )
-      {
-        DBUG_ASSERT(m_hidden_field_count > fields.elements);
+      if (current_counter == distinct)
         new_field->flags|= FIELD_PART_OF_TMP_UNIQUE;
-        m_cycle_fields_count++;
-        if (!(new_field->flags & NOT_NULL_FLAG))
-        {
-          m_cycle_null_count++;
-          m_null_count--;
-        }
-        m_cycle_uneven_bit_length+= uneven_delta;
-        m_uneven_bit_length-= uneven_delta;
-        if (new_field->flags & BLOB_FLAG)
-          m_cycle_blobs_count++;
-      }
     }
-    if (!--m_hidden_field_count)
-    {
-      /*
-        This was the last hidden field; Remember how many hidden fields could
-        have null
-      */
-      m_hidden_null_count= m_null_count;
-      /*
-	We need to update hidden_field_count as we may have stored group
-	functions with constant arguments
-      */
-      param->hidden_field_count= fieldnr;
-      m_null_count= 0;
-      /*
-        On last hidden field we store uneven bit length in
-        m_hidden_uneven_bit_length and proceed calculation of
-        uneven bits for visible fields into m_uneven_bit_length.
-      */
-      m_hidden_uneven_bit_length= m_uneven_bit_length;
-      m_uneven_bit_length= 0;
-    }
+    m_uneven_bit[current_counter]+= uneven_delta;
   }
   share->fields= fieldnr;
   share->blob_fields= m_blob_count;
@@ -18523,10 +18515,12 @@ bool Create_tmp_table::finalize(THD *thd,
   DBUG_ENTER("Create_tmp_table::finalize");
   DBUG_ASSERT(table);
 
-  uint hidden_null_pack_length;
-  uint cycle_null_pack_length, cycle_null_pack_base;
-  uint null_pack_length;
-  uint cycle_null_index;
+  uint null_pack_length[2];
+  uint null_pack_base[2];
+  uint null_counter[2]= {0, 0};
+
+  uint whole_null_pack_length;
+
   bool  use_packed_rows= false;
   uchar *pos;
   uchar *null_flags;
@@ -18577,19 +18571,21 @@ bool Create_tmp_table::finalize(THD *thd,
   if (share->blob_fields == 0)
   {
     /* We need to ensure that first byte is not 0 for the delete link */
-    if (param->hidden_field_count)
-      m_hidden_null_count++;
+    if (m_field_count[other])
+      m_null_count[other]++;
     else
-      m_null_count++;
+      m_null_count[distinct]++;
   }
-  hidden_null_pack_length= (m_hidden_null_count + 7 +
-                            m_hidden_uneven_bit_length) / 8;
-  cycle_null_pack_length= (m_cycle_null_count + 7 +
-                           m_cycle_uneven_bit_length) / 8;
-  cycle_null_pack_base= (hidden_null_pack_length +
-                        (m_null_count + m_uneven_bit_length + 7) / 8);
-  null_pack_length=  cycle_null_pack_base + cycle_null_pack_length;
-  share->reclength+= null_pack_length;
+
+  null_pack_length[other]= (m_null_count[other] + 7 +
+                            m_uneven_bit[other]) / 8;
+  null_pack_base[other]= 0;
+  null_pack_length[distinct]= (m_null_count[distinct] + 7 +
+                              m_uneven_bit[distinct]) / 8;
+  null_pack_base[distinct]= null_pack_length[other];
+  whole_null_pack_length= null_pack_length[other] +
+                          null_pack_length[distinct];
+  share->reclength+= whole_null_pack_length;
   if (!share->reclength)
     share->reclength= 1;                // Dummy select
   /* Use packed rows if there is blobs or a lot of space to gain */
@@ -18613,66 +18609,53 @@ bool Create_tmp_table::finalize(THD *thd,
 
   recinfo=param->start_recinfo;
   null_flags=(uchar*) table->record[0];
-  pos=table->record[0]+ null_pack_length;
-  if (null_pack_length)
+  pos=table->record[0]+ whole_null_pack_length;
+  if (whole_null_pack_length)
   {
     bzero((uchar*) recinfo,sizeof(*recinfo));
     recinfo->type=FIELD_NORMAL;
-    recinfo->length=null_pack_length;
+    recinfo->length= whole_null_pack_length;
     recinfo++;
-    bfill(null_flags,null_pack_length,255);	// Set null fields
+    bfill(null_flags, whole_null_pack_length, 255);	// Set null fields
 
     table->null_flags= (uchar*) table->record[0];
-    share->null_fields= m_null_count + m_hidden_null_count + m_cycle_null_count;
-    share->null_bytes= share->null_bytes_for_compare= null_pack_length;
+    share->null_fields= m_null_count[other] + m_null_count[distinct];
+    share->null_bytes= share->null_bytes_for_compare= whole_null_pack_length;
   }
-  m_null_count= (share->blob_fields == 0) ? 1 : 0;
-  m_hidden_field_count= param->hidden_field_count;
-  cycle_null_index= 0;
+
+  if (share->blob_fields == 0)
+  {
+    null_counter[(m_field_count[other] ? other : distinct)]++;
+  }
   for (uint i= 0; i < share->fields; i++, recinfo++)
   {
     Field *field= table->field[i];
     uint length;
     bzero((uchar*) recinfo,sizeof(*recinfo));
 
+    current_counter= ((field->flags & FIELD_PART_OF_TMP_UNIQUE) ?
+                      distinct :
+                      other);
+
     if (!(field->flags & NOT_NULL_FLAG))
     {
-      if (field->flags & FIELD_PART_OF_TMP_UNIQUE)
-      {
-        recinfo->null_bit= (uint8)1 << (cycle_null_index & 7);
-        recinfo->null_pos= cycle_null_pack_base + cycle_null_index/8;
-        field->move_field(pos, null_flags + recinfo->null_pos,
-			  (uint8)1 << (cycle_null_index & 7));
-        cycle_null_index++;
-      }
-      else
-      {
-        recinfo->null_bit= (uint8)1 << (m_null_count & 7);
-        recinfo->null_pos= m_null_count/8;
-        field->move_field(pos, null_flags + m_null_count/8,
-			  (uint8)1 << (m_null_count & 7));
-        m_null_count++;
-      }
+
+      recinfo->null_bit= (uint8)1 << (null_counter[current_counter] & 7);
+      recinfo->null_pos= (null_pack_base[current_counter] +
+                          null_counter[current_counter]/8);
+      field->move_field(pos, null_flags + recinfo->null_pos, recinfo->null_bit);
+      null_counter[current_counter]++;
     }
     else
       field->move_field(pos,(uchar*) 0,0);
     if (field->type() == MYSQL_TYPE_BIT)
     {
-      if (field->flags & FIELD_PART_OF_TMP_UNIQUE)
-      {
-        /* We have to reserve place for extra bits among null bits */
-        ((Field_bit*) field)->set_bit_ptr(null_flags + cycle_null_pack_base +
-                                          cycle_null_index / 8,
-                                          cycle_null_index & 7);
-        cycle_null_index+= (field->field_length & 7);
-      }
-      else
-      {
-        /* We have to reserve place for extra bits among null bits */
-        ((Field_bit*) field)->set_bit_ptr(null_flags + m_null_count / 8,
-                                          m_null_count & 7);
-        m_null_count+= (field->field_length & 7);
-      }
+      /* We have to reserve place for extra bits among null bits */
+      ((Field_bit*) field)->set_bit_ptr(null_flags +
+                                        null_pack_base[current_counter] +
+                                        null_counter[current_counter]/8,
+                                        null_counter[current_counter] & 7);
+      null_counter[current_counter]+= (field->field_length & 7);
     }
     field->reset();
 
@@ -18711,8 +18694,6 @@ bool Create_tmp_table::finalize(THD *thd,
     /* Make entry for create table */
     recinfo->length=length;
     recinfo->type= field->tmp_engine_column_type(use_packed_rows);
-    if (!--m_hidden_field_count)
-      m_null_count= (m_null_count + 7) & ~7;    // move to next byte
 
     // fix table name in field entry
     field->set_table_name(&table->alias);
@@ -18833,7 +18814,8 @@ bool Create_tmp_table::finalize(THD *thd,
                 m_group_buff <= param->group_buff + param->group_length);
   }
 
-  if (m_distinct && share->fields != param->hidden_field_count)
+  if (m_distinct && (share->fields != param->hidden_field_count ||
+                     m_with_cycle))
   {
     uint i;
     Field **reg_field;
@@ -18845,7 +18827,7 @@ bool Create_tmp_table::finalize(THD *thd,
     */
     DBUG_PRINT("info",("hidden_field_count: %d", param->hidden_field_count));
 
-    if (share->blob_fields)
+    if (m_blobs_count[distinct])
     {
       /*
         Special mode for index creation in MyISAM used to support unique
@@ -18854,15 +18836,8 @@ bool Create_tmp_table::finalize(THD *thd,
       */
       share->uniques= 1;
     }
-    if (m_cycle_fields_count)
-      null_pack_length= cycle_null_pack_length;
-    else
-      null_pack_length-= (hidden_null_pack_length) ;
-    keyinfo->user_defined_key_parts=
-      ((m_cycle_fields_count ?
-        m_cycle_fields_count :
-        (share->fields - param->hidden_field_count)) +
-       (share->uniques ? MY_TEST(null_pack_length) : 0));
+    keyinfo->user_defined_key_parts= m_field_count[distinct] +
+       (share->uniques ? MY_TEST(null_pack_length[distinct]) : 0);
     keyinfo->ext_key_parts= keyinfo->user_defined_key_parts;
     keyinfo->usable_key_parts= keyinfo->user_defined_key_parts;
     table->distinct= 1;
@@ -18905,13 +18880,11 @@ bool Create_tmp_table::finalize(THD *thd,
       blobs can distinguish NULL from 0. This extra field is not needed
       when we do not use UNIQUE indexes for blobs.
     */
-    if (null_pack_length && share->uniques)
+    if (null_pack_length[distinct] && share->uniques)
     {
       m_key_part_info->null_bit=0;
-      m_key_part_info->offset= (m_cycle_fields_count ?
-                                cycle_null_pack_base :
-                                hidden_null_pack_length);
-      m_key_part_info->length=null_pack_length;
+      m_key_part_info->offset= null_pack_base[distinct];
+      m_key_part_info->length= null_pack_length[distinct];
       m_key_part_info->field= new Field_string(table->record[0],
                                              (uint32) m_key_part_info->length,
                                              (uchar*) 0,
@@ -18931,8 +18904,7 @@ bool Create_tmp_table::finalize(THD *thd,
          i < share->fields;
          i++, reg_field++)
     {
-      if (m_cycle_fields_count &&
-          !((*reg_field)->flags & FIELD_PART_OF_TMP_UNIQUE))
+      if (!((*reg_field)->flags & FIELD_PART_OF_TMP_UNIQUE))
         continue;
       m_key_part_info->field= *reg_field;
       (*reg_field)->flags |= PART_KEY_FLAG;
