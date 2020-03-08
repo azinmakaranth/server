@@ -18313,6 +18313,7 @@ bool Create_tmp_table::add_fields(THD *thd,
   DBUG_ASSERT(table->s->blob_fields == 0);
 
   const bool not_all_columns= !(m_select_options & TMP_TABLE_ALL_COLUMNS);
+  bool distinct_record_structure= distinct;
   uint fieldnr= 0;
   TABLE_SHARE  *share= table->s;
   Item **copy_func= param->items_to_copy;
@@ -18324,17 +18325,17 @@ bool Create_tmp_table::add_fields(THD *thd,
   Item *item;
   Field **tmp_from_field= m_from_field;
   uint uneven_delta;
-  if (m_distinct)
-  {
-    while ((item=li++) && !m_with_cycle)
-      if (item->common_flags & IS_IN_WITH_CYCLE)
-        m_with_cycle= true;
-  }
+  while ((item=li++) && !m_with_cycle)
+    if (item->common_flags & IS_IN_WITH_CYCLE)
+    {
+      m_with_cycle= true;
+      distinct_record_structure= true;
+    }
   li.rewind();
   while ((item=li++))
   {
     current_counter= (((param->hidden_field_count < (fieldnr + 1)) &&
-                       m_distinct &&
+                       distinct_record_structure &&
                        (!m_with_cycle ||
                         (item->common_flags & IS_IN_WITH_CYCLE)))?
                       distinct :
@@ -18381,7 +18382,7 @@ bool Create_tmp_table::add_fields(THD *thd,
             create_tmp_field(table, arg, &copy_func,
                              tmp_from_field, &m_default_field[fieldnr],
                              m_group != 0, not_all_columns,
-                             m_distinct, false);
+                             distinct_record_structure , false);
 	  if (!new_field)
 	    goto err;					// Should be OOM
 	  tmp_from_field++;
@@ -18490,6 +18491,8 @@ bool Create_tmp_table::add_fields(THD *thd,
     }
     m_uneven_bit[current_counter]+= uneven_delta;
   }
+  DBUG_ASSERT(fieldnr == m_field_count[other] + m_field_count[distinct]);
+  DBUG_ASSERT(m_blob_count == m_blobs_count[other] + m_blobs_count[distinct]);
   share->fields= fieldnr;
   share->blob_fields= m_blob_count;
   table->field[fieldnr]= 0;                     // End marker

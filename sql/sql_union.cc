@@ -257,6 +257,7 @@ int select_union_recursive::send_data(List<Item> &values)
       write_err != HA_ERR_FOUND_DUPP_UNIQUE)
   { 
     int err;
+    DBUG_ASSERT(incr_table->s->reclength == table->s->reclength);
     if ((err= incr_table->file->ha_write_tmp_row(table->record[0])))
     {
       bool is_duplicate;
