@@ -2,7 +2,7 @@
 #define RPL_PARALLEL_H
 
 #include "log_event.h"
-#include "lf.h"
+
 
 struct rpl_parallel;
 struct rpl_parallel_entry;
@@ -350,9 +350,6 @@ struct rpl_parallel_entry {
   int queue_master_restart(rpl_group_info *rgi,
                            Format_description_log_event *fdev);
 };
-
-class XID_cache_element_para;
-
 struct rpl_parallel {
   HASH domain_hash;
   rpl_parallel_entry *current;
@@ -360,31 +357,13 @@ struct rpl_parallel {
 
   rpl_parallel();
   ~rpl_parallel();
-  bool reset(bool is_parallel);
+  void reset();
   rpl_parallel_entry *find(uint32 domain_id);
   void wait_for_done(THD *thd, Relay_log_info *rli);
   void stop_during_until();
   bool workers_idle();
   int wait_for_workers_idle(THD *thd);
   int do_event(rpl_group_info *serial_rgi, Log_event *ev, ulonglong event_size);
-  void leave(THD *thd, Relay_log_info *rli)
-  {
-    wait_for_done(thd, rli);
-    for (ulong i= 0; i <= opt_slave_parallel_threads; i++)
-      lf_hash_put_pins(rpl_xid_pins[i]);
-    delete[] rpl_xid_pins;
-    xid_cache_free();
-  };
-  // XA related. API follows xa.h naming.
-  LF_HASH xid_cache_para;
-  LF_PINS **rpl_xid_pins;
-
-  void xid_cache_init();
-  void xid_cache_free();
-  bool xid_cache_insert(XID *xid, uint32 idx);
-  void xid_cache_replace(XID *xid, uint32 idx);
-  bool xid_cache_delete(XID_cache_element_para *el, LF_PINS *pins);
-  XID_cache_element_para *xid_cache_search(XID *xid, LF_PINS *pins);
 };
 
 

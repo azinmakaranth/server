@@ -3576,7 +3576,6 @@ public:
   event_mysql_xid_t xid;
 #endif
   uchar flags2;
-  uint32 xid_pins_idx;
   /* Flags2. */
 
   /* FL_STANDALONE is set when there is no terminating COMMIT event. */

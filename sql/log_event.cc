@@ -2559,7 +2559,7 @@ Binlog_checkpoint_log_event::Binlog_checkpoint_log_event(
 
 Gtid_log_event::Gtid_log_event(const char *buf, uint event_len,
                const Format_description_log_event *description_event)
-  : Log_event(buf, description_event), seq_no(0), commit_id(0), xid_pins_idx(0)
+  : Log_event(buf, description_event), seq_no(0), commit_id(0)
 {
   uint8 header_size= description_event->common_header_len;
   uint8 post_header_len= description_event->post_header_len[GTID_EVENT-1];

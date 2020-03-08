@@ -27,38 +27,6 @@ struct rpl_parallel_thread_pool global_rpl_thread_pool;
 static void signal_error_to_sql_driver_thread(THD *thd, rpl_group_info *rgi,
                                               int err);
 
-struct XID_cache_insert_element
-{
-  XID *xid;
-  uint32 worker_idx;
-
-  XID_cache_insert_element(XID *xid_arg, uint32 idx_arg):
-    xid(xid_arg), worker_idx(idx_arg) {}
-};
-
-class XID_cache_element_para
-{
-public:
-  XID xid;
-  uint32 worker_idx;
-  Atomic_counter<int32_t> cnt; // of consecutive namesake xa:s queued for exec
-  static void lf_hash_initializer(LF_HASH *hash __attribute__((unused)),
-                                  XID_cache_element_para *element,
-                                  XID_cache_insert_element *new_element)
-  {
-    element->xid.set(new_element->xid);
-    element->worker_idx= new_element->worker_idx;
-    element->cnt= 1;
-  }
-  static uchar *key(const XID_cache_element_para *element, size_t *length,
-                    my_bool)
-  {
-    *length= element->xid.key_length();
-    return element->xid.key();
-  }
-};
-
-
 static int
 rpt_handle_event(rpl_parallel_thread::queued_event *qev,
                  struct rpl_parallel_thread *rpt)
@@ -303,32 +271,6 @@ finish_event_group(rpl_parallel_thread *rpt, uint64 sub_id,
   */
   thd->get_stmt_da()->reset_diagnostics_area();
   wfc->wakeup_subsequent_commits(rgi->worker_error);
-
-  if (!rgi->current_xid.is_null())
-  {
-    Relay_log_info *rli= rgi->rli;
-    LF_PINS *pins= rli->parallel.rpl_xid_pins[rgi->xid_pins_idx];
-
-    DBUG_ASSERT(rgi->xid_pins_idx > 0 &&
-                rgi->xid_pins_idx <= opt_slave_parallel_threads);
-
-    XID_cache_element_para* el=
-      rli->parallel.xid_cache_search(&rgi->current_xid, pins);
-
-    if (el)
-    {
-      lf_hash_search_unpin(pins); // it's safe unpin now none but us can delete
-      if (el->cnt-- == 1)         // comparison aganst old value
-        (void) rli->parallel.xid_cache_delete(el, pins);
-
-      DBUG_ASSERT(el->cnt >= 0);
-    }
-    else
-    {
-      // no record is begign when replication resumes after XA PREPARE.
-      sql_print_warning(ER_THD(rli->sql_driver_thd, ER_XAER_NOTA));
-    }
-  }
   rgi->current_xid.null();
 }
 
@@ -1332,10 +1274,7 @@ handle_rpl_parallel_thread(void *arg)
         }
         if (static_cast<Gtid_log_event*>(qev->ev)->
             flags2 & Gtid_log_event::FL_COMPLETED_XA)
-        {
           rgi->current_xid.set(&static_cast<Gtid_log_event*>(qev->ev)->xid);
-          rgi->xid_pins_idx= static_cast<Gtid_log_event*>(qev->ev)->xid_pins_idx;
-        }
       }
 
       group_rgi= rgi;
@@ -2186,42 +2125,23 @@ rpl_parallel_entry::choose_thread(rpl_group_info *rgi, bool *did_enter_cond,
   uint32 idx;
   Relay_log_info *rli= rgi->rli;
   rpl_parallel_thread *thr;
-  bool reuse= gtid_ev == NULL;
 
   idx= rpl_thread_idx;
-
-  if (!reuse)
+  if (gtid_ev)
   {
     if (gtid_ev->flags2 &
         (Gtid_log_event::FL_COMPLETED_XA | Gtid_log_event::FL_PREPARED_XA))
+      idx= my_hash_sort(&my_charset_bin, gtid_ev->xid.key(),
+                        gtid_ev->xid.key_length()) % rpl_thread_max;
+    else
     {
-      LF_PINS *pins= rli->parallel.rpl_xid_pins[0];
-      XID_cache_element_para* el= rli->parallel.xid_cache_search(&gtid_ev->xid,
-                                                                 pins);
-
-      if (el)
-      {
-        idx= el->worker_idx;
-        lf_hash_search_unpin(pins);
-        goto idx_assigned;
-      }
-      else
-      {
-        // Further execution will clear out whether it's indeed the error case.
-        // XA completion event may arrive without the prepare one done so.
-        if  (gtid_ev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
-          sql_print_warning(ER_THD(rli->sql_driver_thd, ER_XAER_NOTA));
-      }
+      ++idx;
+      if (idx >= rpl_thread_max)
+        idx= 0;
     }
-    ++idx;
-    if (idx >= rpl_thread_max)
-      idx= 0;
-
-idx_assigned:
     rpl_thread_idx= idx;
   }
   thr= rpl_threads[idx];
-
   if (thr)
   {
     *did_enter_cond= false;
@@ -2291,14 +2211,6 @@ idx_assigned:
     rpl_threads[idx]= thr= global_rpl_thread_pool.get_thread(&rpl_threads[idx],
                                                              this);
 
-  if (thr && gtid_ev)
-  {
-    if (gtid_ev->flags2 & Gtid_log_event::FL_PREPARED_XA)
-      (void) rli->parallel.xid_cache_replace(&gtid_ev->xid, idx);
-    else if (gtid_ev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
-      gtid_ev->xid_pins_idx= idx + 1; // pass pins index to the assigned worker
-  }
-
   return thr;
 }
 
@@ -2327,21 +2239,12 @@ rpl_parallel::rpl_parallel() :
 }
 
 
-bool
-rpl_parallel::reset(bool is_parallel)
+void
+rpl_parallel::reset()
 {
   my_hash_reset(&domain_hash);
   current= NULL;
   sql_thread_stopping= false;
-  if (is_parallel)
-  {
-    xid_cache_init();
-    rpl_xid_pins= new LF_PINS*[opt_slave_parallel_threads + 1];
-    for (ulong i= 0; i <= opt_slave_parallel_threads; i++)
-      if (!(rpl_xid_pins[i]= lf_hash_get_pins(&xid_cache_para)))
-        return true;
-  }
-  return false;
 }
 
 
@@ -2601,76 +2504,6 @@ rpl_parallel::wait_for_workers_idle(THD *thd)
       return err;
   }
   return 0;
-}
-
-
-void rpl_parallel::xid_cache_init()
-{
-  lf_hash_init(&xid_cache_para, sizeof(XID_cache_element_para),
-               LF_HASH_UNIQUE, 0, 0,
-               (my_hash_get_key) XID_cache_element_para::key, &my_charset_bin);
-  xid_cache_para.alloc.constructor= NULL;
-  xid_cache_para.alloc.destructor= NULL;
-  xid_cache_para.initializer=
-    (lf_hash_initializer) XID_cache_element_para::lf_hash_initializer;
-}
-
-
-void rpl_parallel::xid_cache_free()
-{
-  lf_hash_destroy(&xid_cache_para);
-}
-
-
-XID_cache_element_para* rpl_parallel::xid_cache_search(XID *xid, LF_PINS* pins)
-{
-  return (XID_cache_element_para*) lf_hash_search(&xid_cache_para, pins,
-                                                  xid->key(),
-                                                  xid->key_length());
-}
-
-/**
-  Insert a first xid-keyed record, or "replace" it with incremented
-  usage counter.
-*/
-void rpl_parallel::xid_cache_replace(XID *xid, uint32 idx)
-{
-  LF_PINS *pins= rpl_xid_pins[idx + 1];
-  XID_cache_element_para* el= xid_cache_search(xid, pins);
-
-  if (el)
-  {
-    if (unlikely(el->cnt++ == 0))
-    {
-      lf_hash_search_unpin(pins);
-      while (xid_cache_search(xid, pins)) // record must be at being deleted
-        (void) LF_BACKOFF();
-      lf_hash_search_unpin(pins);
-      (void) xid_cache_insert(xid, idx);
-    }
-
-    DBUG_ASSERT(el->cnt > 0);
-  }
-  else
-  {
-    (void) xid_cache_insert(xid, idx);
-  }
-  lf_hash_search_unpin(pins);
-}
-
-bool rpl_parallel::xid_cache_insert(XID *xid, uint32 idx)
-{
-  LF_PINS *pins= rpl_xid_pins[idx + 1];
-  XID_cache_insert_element new_element(xid, idx);
-
-  return lf_hash_insert(&xid_cache_para, pins, &new_element);
-}
-
-
-bool rpl_parallel::xid_cache_delete(XID_cache_element_para* el, LF_PINS *pins)
-{
-  return lf_hash_delete(&xid_cache_para, pins,
-                        el->xid.key(), el->xid.key_length());
 }
 
 
