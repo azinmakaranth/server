@@ -83,3 +83,18 @@ drop view v1;
 
 drop table t1;
 
+
+--echo #
+--echo # A simple blob case
+--echo #
+
+create table t1 (a int, b text);
+insert into t1 values (1, "a");
+
+WITH RECURSIVE cte AS (
+	SELECT a, b  from t1 UNION ALL
+	SELECT a, b FROM cte WHERE a IS NOT NULL)
+        CYCLE b RESTRICT
+SELECT * FROM cte;
+
+drop table t1;
